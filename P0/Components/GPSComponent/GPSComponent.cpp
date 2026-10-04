@@ -5,6 +5,7 @@
 // ======================================================================
 
 #include "P0/Components/GPSComponent/GPSComponent.hpp"
+#include <cstdlib>
 #include <cstring>
 #include <Drv/Ports/I2cStatusEnumAc.hpp>
 
@@ -13,24 +14,27 @@ namespace P0 {
 static constexpr U8  GPS_I2C_ADDRESS = 0x42;
 static constexpr U8  GPS_DATA_REG    = 0xFF;
 static constexpr U32 GPS_CHUNK_SIZE  = 32;
-static constexpr U32 GPS_BUFFER_SIZE = 512;
 
-// ubx-nav-pvt payload offsets
-static constexpr U32 PVT_NUM_SV     = 23;   // number of satellites
-static constexpr U32 PVT_LON        = 24;   // longitude (1e-7 degrees)
-static constexpr U32 PVT_LAT        = 28;   // latitude (1e-7 degrees)
-static constexpr U32 PVT_HEIGHT     = 36;   // height above msl (mm)
-static constexpr U32 PVT_GSPEED     = 60;   // ground speed (mm/s)
-static constexpr U32 PVT_PAYLOAD_LEN = 92;
+// upper bound on chunks read per tick - nmea output is ~1KB/s at default rates, so leave headroom to drain the buffer
+static constexpr U32 GPS_MAX_CHUNKS  = 64;
+static constexpr U32 NMEA_MAX_FIELDS = 20;
+static constexpr F32 KNOTS_TO_MPS    = 0.514444f;
 
-static I32 readI32LE(const U8* data) {
-    U32 value = static_cast<U32>(data[0]) |
-                (static_cast<U32>(data[1]) << 8) |
-                (static_cast<U32>(data[2]) << 16) |
-                (static_cast<U32>(data[3]) << 24);
-    return (value & 0x80000000U) != 0
-               ? static_cast<I32>(static_cast<I64>(value) - 0x100000000LL)
-               : static_cast<I32>(value);
+static U8 hexNibble(char c) {
+    if (c >= '0' && c <= '9') return static_cast<U8>(c - '0');
+    if (c >= 'A' && c <= 'F') return static_cast<U8>(c - 'A' + 10);
+    if (c >= 'a' && c <= 'f') return static_cast<U8>(c - 'a' + 10);
+    return 0xFF;
+}
+
+// nmea lat/lon is ddmm.mmmm (or dddmm.mmmm) Degrees and Decimal Minutes (geographic coord format)
+static F64 nmeaToDegrees(const char* value, const char* hemisphere) {
+    if (value[0] == '\0') return 0.0;
+    F64 raw = strtod(value, nullptr);
+    F64 deg = static_cast<F64>(static_cast<I32>(raw / 100.0));
+    F64 result = deg + (raw - deg * 100.0) / 60.0;
+    if (hemisphere[0] == 'S' || hemisphere[0] == 'W') result = -result;
+    return result;
 }
 
 // ----------------------------------------------------------------------
@@ -51,20 +55,17 @@ void GPSComponent ::GPS_RESET_cmdHandler(FwOpcodeType opCode, U32 cmdSeq) {
 }
 
 void GPSComponent::run_handler(FwIndexType portNum, U32 context) {
-    F64 lat = 0.0;
-    F64 lon = 0.0;
-    F32 alt = 0.0f;
-    F32 speed = 0.0f;
-    U8 numSats = 0;
+    GpsSolution sol;
     bool packetFound = false;
 
-    Drv::I2cStatus status = this->readGpsData(lat, lon, alt, speed, numSats, packetFound);
+    Drv::I2cStatus status = this->readGpsData(sol, packetFound);
     if (status != Drv::I2cStatus::I2C_OK || !packetFound) {
         this->tlmWrite_Latitude(0.0);
         this->tlmWrite_Longitude(0.0);
         this->tlmWrite_Altitude(0.0f);
         this->tlmWrite_GroundSpeed(0.0f);
         this->tlmWrite_NumSatellites(0);
+        this->tlmWrite_UTCTime(0);
 
         if (++this->m_missedPackets >= MAX_MISSED_PACKETS) {
             if (this->m_hasFix) {
@@ -81,52 +82,42 @@ void GPSComponent::run_handler(FwIndexType portNum, U32 context) {
 
     this->m_missedPackets = 0;
     this->m_reportedDataUnavailable = false;
-    this->reportGpsTelemetry(lat, lon, alt, speed, numSats);
+    this->reportGpsTelemetry(sol);
 }
 
 // HELPER FUNCTIONS
 
 // push all the gps telemetry channels and log when we acquire or lose a fix
-void GPSComponent::reportGpsTelemetry(F64 lat, F64 lon, F32 alt, F32 speed, U8 numSats) {
-    bool currentFix = (numSats >= MIN_SATELLITES_FOR_FIX);
+void GPSComponent::reportGpsTelemetry(const GpsSolution& sol) {
+    bool currentFix = sol.fixValid && (sol.numSats >= MIN_SATELLITES_FOR_FIX);
 
-    this->tlmWrite_Latitude(lat);
-    this->tlmWrite_Longitude(lon);
-    this->tlmWrite_Altitude(alt);
-    this->tlmWrite_GroundSpeed(speed);
-    this->tlmWrite_NumSatellites(numSats);
+    this->tlmWrite_Latitude(sol.lat);
+    this->tlmWrite_Longitude(sol.lon);
+    this->tlmWrite_Altitude(sol.alt);
+    this->tlmWrite_GroundSpeed(sol.speed);
+    this->tlmWrite_NumSatellites(sol.numSats);
+    this->tlmWrite_UTCTime(sol.utcTime);
 
-    // throttle the event log - nav-pvt fires every second and event bandwidth is limited
+    // throttle the event log - gga fires every second and event bandwidth is limited
     if (++m_readCount % READ_LOG_INTERVAL == 0) {
-        this->log_ACTIVITY_LO_GpsReading(lat, lon, alt, numSats);
+        this->log_ACTIVITY_LO_GpsReading(sol.lat, sol.lon, sol.alt, sol.numSats);
     }
 
     if (currentFix && !this->m_hasFix) {
         this->m_hasFix = true;
-        this->log_ACTIVITY_HI_GpsFixAcquired(numSats);
+        this->log_ACTIVITY_HI_GpsFixAcquired(sol.numSats);
     } else if (!currentFix && this->m_hasFix) {
         this->m_hasFix = false;
         this->log_WARNING_HI_GpsFixLost();
     }
 }
 
-// NEO-M9N only gives data through reg 0xff in 32-byte chunks padded with 0xff fill - strip those and scan for the packet
-Drv::I2cStatus GPSComponent::readGpsData(F64& lat, F64& lon, F32& alt, F32& speed, U8& numSats, bool& packetFound) {
+// NEO-M9N only gives data through reg 0xff in 32-byte chunks padded with 0xff fill - strip those and feed the nmea line parser
+Drv::I2cStatus GPSComponent::readGpsData(GpsSolution& sol, bool& packetFound) {
     packetFound = false;
-
-    // send the ubx-nav-pvt poll request so the gps queues up a fresh packet
-    {
-        U8 poll[] = {0xB5, 0x62, 0x01, 0x07, 0x00, 0x00, 0x08, 0x19};
-        Fw::Buffer pollBuf(poll, sizeof(poll));
-        this->busWrite_out(0, GPS_I2C_ADDRESS, pollBuf);
-    }
-
-    U8 accumBuf[GPS_BUFFER_SIZE] = {};
-    U32 accumLen = 0;
     U32 emptyChunks = 0;
 
-    // read up to 16 chunks of 32 bytes from reg 0xff
-    for (U32 attempts = 0; attempts < 16; attempts++) {
+    for (U32 attempts = 0; attempts < GPS_MAX_CHUNKS; attempts++) {
         U8 regAddr = GPS_DATA_REG;
         Fw::Buffer writeBuffer(&regAddr, sizeof(regAddr));
         U8 chunk[GPS_CHUNK_SIZE] = {};
@@ -137,11 +128,11 @@ Drv::I2cStatus GPSComponent::readGpsData(F64& lat, F64& lon, F32& alt, F32& spee
             return status;
         }
 
-        // copy only non-0xff bytes into accumBuf - 0xff is fill, not real data
+        // 0xff is fill, not real data - everything else is nmea ascii
         bool hasData = false;
-        for (U32 i = 0; i < GPS_CHUNK_SIZE && accumLen < GPS_BUFFER_SIZE; i++) {
+        for (U32 i = 0; i < GPS_CHUNK_SIZE; i++) {
             if (chunk[i] != 0xFF) {
-                accumBuf[accumLen++] = chunk[i];
+                this->processNmeaByte(static_cast<char>(chunk[i]), sol, packetFound);
                 hasData = true;
             }
         }
@@ -155,56 +146,85 @@ Drv::I2cStatus GPSComponent::readGpsData(F64& lat, F64& lon, F32& alt, F32& spee
         }
     }
 
-    // nothing came back at all - that's ok, just no packet this tick
-    if (accumLen == 0) {
-        return Drv::I2cStatus::I2C_OK;
-    }
-
-    // scan the accumulated bytes for ubx-nav-pvt: sync 0xb5 0x62, class 0x01, id 0x07
-    for (U32 i = 0; i + 6 < accumLen; i++) {
-        if (accumBuf[i] != 0xB5 || accumBuf[i + 1] != 0x62) continue;
-        if (accumBuf[i + 2] != 0x01 || accumBuf[i + 3] != 0x07) continue;
-
-        // payload length is little-endian in bytes 4-5 of the ubx header
-        U16 payloadLen = static_cast<U16>(accumBuf[i + 4]) |
-                         (static_cast<U16>(accumBuf[i + 5]) << 8);
-
-        // sanity check: nav-pvt is always 92 bytes, and we need to have the full packet plus 2 checksum bytes
-        if (payloadLen != PVT_PAYLOAD_LEN) continue;
-        if (i + 6 + payloadLen + 2 > accumLen) continue;
-
-        const U8* payload = &accumBuf[i + 6];
-
-        // verify fletcher checksum - runs over everything from class byte onward (skips the two sync bytes)
-        U8 ck_a = 0, ck_b = 0;
-        for (U32 j = 2; j < 6 + payloadLen; j++) {
-            ck_a += accumBuf[i + j];
-            ck_b += ck_a;
-        }
-        if (ck_a != accumBuf[i + 6 + payloadLen] ||
-            ck_b != accumBuf[i + 6 + payloadLen + 1]) {
-            continue;  // checksum failed, keep scanning in case there's another packet
-        }
-
-        // pull the fields we care about - all are little-endian i32 except numSv which is a plain byte
-        numSats = payload[PVT_NUM_SV];
-
-        I32 lonRaw    = readI32LE(&payload[PVT_LON]);
-        I32 latRaw    = readI32LE(&payload[PVT_LAT]);
-        I32 heightMSL = readI32LE(&payload[PVT_HEIGHT]);
-        I32 gSpeed    = readI32LE(&payload[PVT_GSPEED]);
-
-        // scale from ubx units to human units: 1e-7 deg, mm→m, mm/s→m/s
-            lon = static_cast<F64>(lonRaw) * 1e-7;
-            lat = static_cast<F64>(latRaw) * 1e-7;
-            alt = static_cast<F32>(heightMSL) / 1000.0f;
-            speed = static_cast<F32>(gSpeed) / 1000.0f;
-            packetFound = true;
-
-        break;
-    }
-
+    // speed comes from rmc, which may have arrived on an earlier tick than the gga
+    sol.speed = this->m_lastSpeed;
     return Drv::I2cStatus::I2C_OK;
+}
+
+// sentences can straddle chunk/tick boundaries, so accumulate into a persistent line buffer
+void GPSComponent::processNmeaByte(char c, GpsSolution& sol, bool& packetFound) {
+    if (c == '$') {
+        this->m_nmeaLen = 0;
+        this->m_nmeaLine[this->m_nmeaLen++] = c;
+        return;
+    }
+    if (this->m_nmeaLen == 0) {
+        return;  // waiting for start of a sentence
+    }
+    if (c == '\r' || c == '\n') {
+        this->m_nmeaLine[this->m_nmeaLen] = '\0';
+        if (this->parseNmeaSentence(this->m_nmeaLine, sol)) {
+            packetFound = true;
+        }
+        this->m_nmeaLen = 0;
+        return;
+    }
+    if (this->m_nmeaLen < NMEA_LINE_MAX - 1) {
+        this->m_nmeaLine[this->m_nmeaLen++] = c;
+    } else {
+        this->m_nmeaLen = 0;  // overlong line, drop it
+    }
+}
+
+// validates checksum and decodes gga/rmc - returns true only when a gga updated the solution
+bool GPSComponent::parseNmeaSentence(char* line, GpsSolution& sol) {
+    // checksum is xor of everything between '$' and '*', sent as two hex digits
+    char* star = strchr(line, '*');
+    if (star == nullptr || star[1] == '\0' || star[2] == '\0') return false;
+    U8 hi = hexNibble(star[1]);
+    U8 lo = hexNibble(star[2]);
+    if (hi == 0xFF || lo == 0xFF) return false;
+    U8 sum = 0;
+    for (const char* p = line + 1; p < star; p++) {
+        sum ^= static_cast<U8>(*p);
+    }
+    if (sum != static_cast<U8>((hi << 4) | lo)) return false;
+    *star = '\0';
+
+    // split on commas in place - strtok would collapse the empty fields nmea uses for "no data"
+    char* fields[NMEA_MAX_FIELDS] = {};
+    U32 numFields = 0;
+    fields[numFields++] = line + 1;
+    for (char* p = line + 1; *p != '\0' && numFields < NMEA_MAX_FIELDS; p++) {
+        if (*p == ',') {
+            *p = '\0';
+            fields[numFields++] = p + 1;
+        }
+    }
+
+    // match on sentence type only so any talker id works (GP, GN, GL...)
+    size_t idLen = strlen(fields[0]);
+    if (idLen < 5) return false;
+    const char* type = fields[0] + idLen - 3;
+
+    // $xxGGA,time,lat,N,lon,E,quality,numSV,hdop,alt,M,...
+    if (strcmp(type, "GGA") == 0 && numFields >= 10) {
+        sol.utcTime = static_cast<U32>(strtoul(fields[1], nullptr, 10));  // hhmmss
+        sol.lat = nmeaToDegrees(fields[2], fields[3]);
+        sol.lon = nmeaToDegrees(fields[4], fields[5]);
+        sol.fixValid = strtol(fields[6], nullptr, 10) > 0;
+        sol.numSats = static_cast<U8>(strtoul(fields[7], nullptr, 10));
+        sol.alt = static_cast<F32>(strtod(fields[9], nullptr));  // metres above msl
+        return true;
+    }
+
+    // $xxRMC,time,status,lat,N,lon,E,speed(knots),...
+    if (strcmp(type, "RMC") == 0 && numFields >= 8) {
+        this->m_lastSpeed = (fields[2][0] == 'A')
+                                ? static_cast<F32>(strtod(fields[7], nullptr)) * KNOTS_TO_MPS
+                                : 0.0f;
+    }
+    return false;
 }
 
 // ubx frame: 0xb5 0x62 (sync), class 0x06, id 0x8a (cfg-valset), len, payload, then fletcher checksum
