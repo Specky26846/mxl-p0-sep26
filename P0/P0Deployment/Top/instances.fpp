@@ -49,12 +49,7 @@ module P0 {
     stack size Default.STACK_SIZE \
     priority 40
 
-  instance helloWorld: HelloWorld base id 0x10005000 \
-    queue size Default.QUEUE_SIZE \
-    stack size Default.STACK_SIZE \
-    priority 50
-
-  instance gpsComponent: GPSComponent base id 0x10006000 \
+  instance gpsComponent: GPSComponent base id 0x10005000 \
     queue size Default.QUEUE_SIZE \
     stack size Default.STACK_SIZE \
     priority 90

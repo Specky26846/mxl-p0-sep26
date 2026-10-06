@@ -32,7 +32,6 @@ module P0 {
     instance timer
     instance comDriver
     instance cmdSeq
-    instance helloWorld
     instance gpsComponent
     instance gpsI2cDriver
 
