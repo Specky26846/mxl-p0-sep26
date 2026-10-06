@@ -20,6 +20,7 @@ static constexpr U32 GPS_MAX_CHUNKS  = 64;
 static constexpr U32 NMEA_MAX_FIELDS = 20;
 static constexpr F32 KNOTS_TO_MPS    = 0.514444f;
 
+// converts one hex character into 4-bit value for checksum validation - returns 0xFF for invalid hex
 static U8 hexNibble(char c) {
     if (c >= '0' && c <= '9') return static_cast<U8>(c - '0');
     if (c >= 'A' && c <= 'F') return static_cast<U8>(c - 'A' + 10);
